@@ -31,7 +31,7 @@ plot_slide:
 	done
 
 DATA_ROOT := ./data/mvtec_ad_2
-EXPNAME := test
+EXPNAME := EX1120_dinov2_small_resize_448_448_center_crop_GNL
 ENCODER_NAME := dinov2reg_vit_small_14
 
 train_and_eval: train_mvtecad2 MVTecAD2_evaluate_test_public
