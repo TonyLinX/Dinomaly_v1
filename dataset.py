@@ -51,7 +51,7 @@ class MVTecDataset(torch.utils.data.Dataset):
         if phase == 'train':
             self.img_path = os.path.join(root, 'train')
         else:
-            self.img_path = os.path.join(root, 'test')
+            self.img_path = os.path.join(root, 'test_public')
             self.gt_path = os.path.join(root, 'ground_truth')
         self.transform = transform
         self.gt_transform = gt_transform
