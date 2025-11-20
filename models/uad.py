@@ -34,7 +34,7 @@ class ViTill(nn.Module):
             self.encoder.num_register_tokens = 0
         self.mask_neighbor_size = mask_neighbor_size
 
-    def forward(self, x):
+    def forward(self, x, return_decoder_blocks=False):
         x = self.encoder.prepare_tokens(x)
         en_list = []
         for i, blk in enumerate(self.encoder.blocks):
@@ -74,9 +74,16 @@ class ViTill(nn.Module):
         if not self.remove_class_token:  # class tokens have not been removed above
             en = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in en]
             de = [d[:, 1 + self.encoder.num_register_tokens:, :] for d in de]
+            de_block = [d[:, 1 + self.encoder.num_register_tokens:, :] for d in de_list]
+        else:
+            de_block = de_list
 
         en = [e.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for e in en]
         de = [d.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for d in de]
+        de_block = [d.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for d in de_block]
+
+        if return_decoder_blocks:
+            return en, de, de_block
         return en, de
 
     def fuse_feature(self, feat_list):

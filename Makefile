@@ -31,13 +31,13 @@ plot_slide:
 	done
 
 DATA_ROOT := ./data/mvtec_ad_2
-EXPNAME := dinov2_small_resize_448_448_without_center_crop
+EXPNAME := test
 ENCODER_NAME := dinov2reg_vit_small_14
 
 train_and_eval: train_mvtecad2 MVTecAD2_evaluate_test_public
 
 train_mvtecad2:
-	python dinomaly_mvtec_sep_mvtec_ad2.py \
+	python dinomaly_mvtec_sep_mvtecad2.py \
 		--data_path $(DATA_ROOT) \
 		--encoder_name $(ENCODER_NAME) \
 		--save_dir ./saved_results \
@@ -55,7 +55,7 @@ MVTecAD2_evaluate_test_public:
 	done
 
 inference_mvtecad2:
-	python dinomaly_mvtec_sep_mvtec_ad2_infer.py \
+	python dinomaly_mvtec_sep_mvtecad2_infer.py \
 		--data_path ./data/mvtec_ad_2 \
 		--save_dir ./saved_results \
 		--save_name $(EXPNAME) \

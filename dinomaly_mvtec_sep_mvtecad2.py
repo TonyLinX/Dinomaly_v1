@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from dataset import get_data_transforms, get_strong_transforms
 from torchvision.datasets import ImageFolder
+import torchvision.transforms as transforms
 import numpy as np
 import random
 import os
@@ -36,6 +37,7 @@ import logging
 from sklearn.metrics import roc_auc_score, average_precision_score
 import itertools
 
+import GNL.GNL_dataset as gnl_dataset
 warnings.filterwarnings("ignore")
 
 
@@ -109,6 +111,14 @@ def get_logger(name, save_path=None, level='INFO'):
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def cosine_sum_layers(a_feats, b_feats, layers):
+    cos = torch.nn.CosineSimilarity()
+    a_sum = sum(a_feats[idx] for idx in layers)
+    b_sum = sum(b_feats[idx] for idx in layers)
+    return torch.mean(1 - cos(a_sum.view(a_sum.shape[0], -1),
+                              b_sum.view(b_sum.shape[0], -1)))
 
 
 def setup_seed(seed):
@@ -228,7 +238,18 @@ def train(item):
     train_path = os.path.join(args.data_path, item, 'train')
     # test_path = os.path.join(args.data_path, item)
 
-    train_data = ImageFolder(root=train_path, transform=data_transform)
+    gnl_dataset.IMAGE_SIZE = crop_size if USE_CENTER_CROP else image_size
+    resize_only = [transforms.Resize((image_size, image_size))]
+    if USE_CENTER_CROP:
+        resize_only.append(transforms.CenterCrop(crop_size))
+    resize_only = transforms.Compose(resize_only)
+    preprocess = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=gnl_dataset.mean_train, std=gnl_dataset.std_train),
+    ])
+
+    train_data = ImageFolder(root=train_path, transform=resize_only)
+    train_data = gnl_dataset.AugMixDatasetMVTec(train_data, preprocess)
     # test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test_public")
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=12,
                                                    drop_last=True)
@@ -272,6 +293,9 @@ def train(item):
                    mask_neighbor_size=0, fuse_layer_encoder=fuse_layer_encoder, fuse_layer_decoder=fuse_layer_decoder)
     model = model.to(device)
     trainable = nn.ModuleList([bottleneck, decoder])
+    model.encoder.eval()
+    for p in model.encoder.parameters():
+        p.requires_grad = False
 
     for m in trainable.modules():
         if isinstance(m, nn.Linear):
@@ -293,16 +317,25 @@ def train(item):
     it = 0
     for epoch in range(int(np.ceil(total_iters / len(train_dataloader)))):
         model.train()
+        model.encoder.eval()
 
         loss_list = []
-        for img, label in train_dataloader:
-            img = img.to(device)
-            label = label.to(device)
+        for normal, augmix_img, gray_img in train_dataloader:
+            normal = normal.to(device)
+            augmix_img = augmix_img.to(device)
+            gray_img = gray_img.to(device)
 
-            en, de = model(img)
+            en_normal, de_normal, de_blocks_normal = model(normal, return_decoder_blocks=True)
+            _, _, de_blocks_aug = model(augmix_img, return_decoder_blocks=True)
+            _, _, de_blocks_gray = model(gray_img, return_decoder_blocks=True)
 
             p = min(P_FINAL * it / 1000, P_FINAL)
-            loss = global_cosine_hm_percent(en, de, p=p, factor=LOSS_FACTOR)
+            origin_loss = global_cosine_hm_percent(en_normal, de_normal, p=p, factor=LOSS_FACTOR)
+            loss_front = cosine_sum_layers(de_blocks_aug, de_blocks_normal, [0, 1, 2, 3]) + \
+                         cosine_sum_layers(de_blocks_gray, de_blocks_normal, [0, 1, 2, 3])
+            loss_back = cosine_sum_layers(de_blocks_aug, de_blocks_normal, [4, 5, 6, 7]) + \
+                        cosine_sum_layers(de_blocks_gray, de_blocks_normal, [4, 5, 6, 7])
+            loss = 0.9 * origin_loss + 0.05 * loss_front + 0.05 * loss_back
 
             optimizer.zero_grad()
             loss.backward()
