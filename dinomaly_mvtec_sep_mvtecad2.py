@@ -36,6 +36,8 @@ import logging
 from sklearn.metrics import roc_auc_score, average_precision_score
 import itertools
 
+from preprocessing import attach_preprocessing
+
 warnings.filterwarnings("ignore")
 
 
@@ -224,6 +226,7 @@ def train(item):
     crop_size = CROP_SIZE if USE_CENTER_CROP else IMAGE_SIZE
 
     data_transform, gt_transform = get_data_transforms(image_size, crop_size)
+    data_transform = attach_preprocessing(data_transform)
 
     train_path = os.path.join(args.data_path, item, 'train')
     # test_path = os.path.join(args.data_path, item)

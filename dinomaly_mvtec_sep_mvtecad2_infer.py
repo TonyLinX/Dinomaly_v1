@@ -17,6 +17,7 @@ from models import vit_encoder
 from models.uad import ViTill
 from models.vision_transformer import Block as VitBlock, bMlp, LinearAttention2
 from utils import cal_anomaly_maps, get_gaussian_kernel
+from preprocessing import attach_preprocessing
 
 DEFAULT_ITEMS = ['can', 'fabric', 'fruit_jelly', 'rice', 'sheet_metal', 'vial', 'wallplugs', 'walnuts']
 
@@ -250,6 +251,7 @@ def main():
     print_fn = logger.info
 
     data_transform, _ = get_data_transforms(IMAGE_SIZE, effective_crop)
+    data_transform = attach_preprocessing(data_transform)
 
     print_fn(f'Running inference on device: {device}')
     print_fn(f'Encoder: {ENCODER_NAME} | center_crop: {USE_CENTER_CROP} (image_size={IMAGE_SIZE}, crop_size={effective_crop})')
