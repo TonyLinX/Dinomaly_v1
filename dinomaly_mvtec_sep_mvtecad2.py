@@ -35,6 +35,9 @@ import copy
 import logging
 from sklearn.metrics import roc_auc_score, average_precision_score
 import itertools
+from tools.light_augment import apply_light_augment
+from torchvision import transforms
+import math
 
 warnings.filterwarnings("ignore")
 
@@ -51,7 +54,7 @@ IMAGE_SIZE = 448
 CROP_SIZE = 392  # crop_size == IMAGE_SIZE 等於「不實際裁掉內容」
 
 # Transform options
-USE_CENTER_CROP = True
+USE_CENTER_CROP = False
 
 # Model
 DEFAULT_ENCODER_NAME = 'dinov2reg_vit_small_14'
@@ -74,6 +77,11 @@ GRAD_CLIP_MAX_NORM = 0.1
 # Loss (global_cosine_hm_percent)
 P_FINAL = 0.9
 LOSS_FACTOR = 0.1
+# LAMBDA_INV = 0.1
+
+LAMBDA_INV_FRONT = 0.05
+LAMBDA_INV_BACK  = 0.0
+
 
 # Inference / heatmap
 GAUSSIAN_KERNEL_SIZE = 5
@@ -87,6 +95,122 @@ class BatchNorm1d(nn.BatchNorm1d):
         x = super(BatchNorm1d, self).forward(x)
         x = x.permute(0, 2, 1)
         return x
+
+
+class TripleLightAugTransform:
+    """
+    生成原圖 + 兩張 light augment 圖，並在 CPU 端完成 augment；
+    後處理與原本一致（resize -> center crop -> ToTensor -> normalize）。
+    """
+    def __init__(self, image_size, crop_size, mean=None, std=None, use_center_crop=True):
+        mean = [0.485, 0.456, 0.406] if mean is None else mean
+        std = [0.229, 0.224, 0.225] if std is None else std
+        self.resize = transforms.Resize((image_size, image_size))
+        self.center_crop = transforms.CenterCrop(crop_size)
+        self.use_center_crop = use_center_crop
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(mean=mean, std=std)
+
+    def _post_process(self, img_pil: Image.Image):
+        if self.use_center_crop:
+            img_pil = self.center_crop(img_pil)
+        img = self.to_tensor(img_pil)
+        img = self.normalize(img)
+        return img
+
+    def __call__(self, img_pil: Image.Image):
+        # resize once，避免 augment 前後尺寸不一致
+        img_resized = self.resize(img_pil)
+        img_np = np.array(img_resized)
+
+        aug1_np = apply_light_augment(img_np)
+        aug2_np = apply_light_augment(img_np)
+
+        img_orig = Image.fromarray(img_np)
+        img_aug1 = Image.fromarray(aug1_np)
+        img_aug2 = Image.fromarray(aug2_np)
+
+        return (
+            self._post_process(img_orig),
+            self._post_process(img_aug1),
+            self._post_process(img_aug2),
+        )
+
+
+class LightInvariantProjector(nn.Module):
+    """
+    g(F): illumination-invariant projector
+    input : [B, C, H, W]
+    output: [B, C, H, W]  (同維度，好接回 Dinomaly 的 RD)
+    """
+    def __init__(self, in_channels: int, hidden_ratio: float = 2.0):
+        super().__init__()
+        hidden = int(in_channels * hidden_ratio)
+
+        self.conv1 = nn.Conv2d(in_channels, hidden, kernel_size=1, bias=False)
+        self.norm1 = nn.GroupNorm(1, hidden)   # InstanceNorm over channel
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv2d(hidden, in_channels, kernel_size=1, bias=False)
+        self.norm2 = nn.GroupNorm(1, in_channels)
+
+    def forward(self, F_in: torch.Tensor) -> torch.Tensor:
+        residual = F_in
+
+        x = self.conv1(F_in)
+        x = self.norm1(x)
+        x = self.act(x)
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+
+        # 殘差：讓 g 一開始接近 identity，保護 regular performance
+        out = self.act(x + residual)
+        return out
+
+
+def illumination_invariance_loss(Z0, Z1, Z2, reduction: str = "mean"):
+    """
+    L_inv = ||Z1 - sg(Z0)||_2^2 + ||Z2 - sg(Z0)||_2^2
+    """
+    Z0_anchor = Z0.detach()
+
+    diff1 = (Z1 - Z0_anchor) ** 2
+    diff2 = (Z2 - Z0_anchor) ** 2
+
+    if reduction == "mean":
+        L1 = diff1.mean()
+        L2 = diff2.mean()
+    elif reduction == "sum":
+        L1 = diff1.sum()
+        L2 = diff2.sum()
+    else:  # "none"
+        L1 = diff1
+        L2 = diff2
+
+    return L1 + L2
+
+
+@torch.no_grad()
+def extract_fused_encoder_features(model: nn.Module, x: torch.Tensor):
+    """
+    從 ViTill 取出 encoder fuse 後的兩組特徵（前4/後4），不經 bottleneck/decoder。
+    """
+    encoder = model.encoder
+    x_tokens = encoder.prepare_tokens(x)
+    en_list = []
+    for i, blk in enumerate(encoder.blocks):
+        if i <= model.target_layers[-1]:
+            x_tokens = blk(x_tokens)
+        else:
+            continue
+        if i in model.target_layers:
+            en_list.append(x_tokens)
+
+    side = int(math.sqrt(en_list[0].shape[1] - 1 - encoder.num_register_tokens))
+    fused = [model.fuse_feature([en_list[idx] for idx in idxs]) for idxs in model.fuse_layer_encoder]
+    fused = [f[:, 1 + encoder.num_register_tokens:, :] for f in fused]
+    fused = [f.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for f in fused]
+    return fused
 
 
 def get_logger(name, save_path=None, level='INFO'):
@@ -118,6 +242,15 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    """
+    Ensure each DataLoader worker has a deterministic RNG state for numpy/random.
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def save_config(args, item_list, use_center_crop: bool):
@@ -166,6 +299,9 @@ def save_config(args, item_list, use_center_crop: bool):
                 "name": "global_cosine_hm_percent",
                 "p_final": P_FINAL,
                 "factor": LOSS_FACTOR,
+                # "lambda_inv": LAMBDA_INV,
+                "LAMBDA_INV_FRONT": LAMBDA_INV_FRONT,
+                "LAMBDA_INV_BACK": LAMBDA_INV_BACK,
             },
             "grad_clip_max_norm": GRAD_CLIP_MAX_NORM,
         },
@@ -223,15 +359,25 @@ def train(item):
     image_size = IMAGE_SIZE
     crop_size = CROP_SIZE if USE_CENTER_CROP else IMAGE_SIZE
 
-    data_transform, gt_transform = get_data_transforms(image_size, crop_size)
+    train_transform = TripleLightAugTransform(image_size, crop_size, use_center_crop=USE_CENTER_CROP)
+    eval_transform, gt_transform = get_data_transforms(image_size, crop_size)
 
     train_path = os.path.join(args.data_path, item, 'train')
     # test_path = os.path.join(args.data_path, item)
 
-    train_data = ImageFolder(root=train_path, transform=data_transform)
+    train_data = ImageFolder(root=train_path, transform=train_transform)
     # test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test_public")
-    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=12,
-                                                   drop_last=True)
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=12,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
     # test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=12)
 
     encoder_name = ENCODER_NAME
@@ -257,6 +403,8 @@ def train(item):
 
     bottleneck = []
     decoder = []
+    projector_front = LightInvariantProjector(embed_dim).to(device)
+    projector_back = LightInvariantProjector(embed_dim).to(device)
 
     bottleneck.append(bMlp(embed_dim, embed_dim * 4, embed_dim, drop=0.2))
     bottleneck = nn.ModuleList(bottleneck)
@@ -271,7 +419,7 @@ def train(item):
     model = ViTill(encoder=encoder, bottleneck=bottleneck, decoder=decoder, target_layers=target_layers,
                    mask_neighbor_size=0, fuse_layer_encoder=fuse_layer_encoder, fuse_layer_decoder=fuse_layer_decoder)
     model = model.to(device)
-    trainable = nn.ModuleList([bottleneck, decoder])
+    trainable = nn.ModuleList([bottleneck, decoder, projector_front, projector_back])
 
     for m in trainable.modules():
         if isinstance(m, nn.Linear):
@@ -293,23 +441,44 @@ def train(item):
     it = 0
     for epoch in range(int(np.ceil(total_iters / len(train_dataloader)))):
         model.train()
+        projector_front.train()
+        projector_back.train()
 
         loss_list = []
-        for img, label in train_dataloader:
-            img = img.to(device)
-            label = label.to(device)
+        for imgs, label in train_dataloader:
+            img_orig, img_aug1, img_aug2 = imgs
+            img_orig = img_orig.to(device, non_blocking=True)
+            img_aug1 = img_aug1.to(device, non_blocking=True)
+            img_aug2 = img_aug2.to(device, non_blocking=True)
 
-            en, de = model(img)
+            en0, de0 = model(img_orig)
+            F_front0, F_back0 = en0
+            H_front0, H_back0 = de0
+
+            F_front1, F_back1 = extract_fused_encoder_features(model, img_aug1)
+            F_front2, F_back2 = extract_fused_encoder_features(model, img_aug2)
+
+            Z_front0 = projector_front(F_front0)
+            Z_back0 = projector_back(F_back0)
+            Z_front1 = projector_front(F_front1)
+            Z_back1 = projector_back(F_back1)
+            Z_front2 = projector_front(F_front2)
+            Z_back2 = projector_back(F_back2)
+
+            L_inv_front = illumination_invariance_loss(Z_front0, Z_front1, Z_front2, reduction="mean")
+            L_inv_back = illumination_invariance_loss(Z_back0, Z_back1, Z_back2, reduction="mean")
+            L_inv = L_inv_front + L_inv_back
 
             p = min(P_FINAL * it / 1000, P_FINAL)
-            loss = global_cosine_hm_percent(en, de, p=p, factor=LOSS_FACTOR)
+            L_RD = global_cosine_hm_percent([Z_front0, Z_back0], [H_front0, H_back0], p=p, factor=LOSS_FACTOR)
+            L_total = L_RD + LAMBDA_INV_FRONT * L_inv_front + LAMBDA_INV_BACK * L_inv_back
 
             optimizer.zero_grad()
-            loss.backward()
+            L_total.backward()
             nn.utils.clip_grad_norm(trainable.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
 
             optimizer.step()
-            loss_list.append(loss.item())
+            loss_list.append(L_total.item())
             lr_scheduler.step()
 
             # if (it + 1) % 5000 == 0:
@@ -325,6 +494,10 @@ def train(item):
             if it == total_iters:
                 break
             if (it + 1) % 100 == 0:
+                print_fn(
+                    f"iter {it}: L_RD={L_RD.item():.4f},  L_inv_front={L_inv_front.item():.4f}, "
+                    f"L_inv_back={L_inv_back.item():.4f}, L_inv={L_inv.item():.4f}, L_total={L_total.item():.4f}"
+                )
                 print_fn('iter [{}/{}], loss:{:.4f}'.format(it, total_iters, np.mean(loss_list)))
                 loss_list = []
 
@@ -335,13 +508,19 @@ def train(item):
         f'{item}_model_{total_iters}.pth'
     )
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-    torch.save(model.state_dict(), ckpt_path)
+    torch.save({
+        'model': model.state_dict(),
+        'projector_front': projector_front.state_dict(),
+        'projector_back': projector_back.state_dict(),
+    }, ckpt_path)
 
     # Inference on test_public split and save anomaly maps as .tiff
     model.eval()
+    projector_front.eval()
+    projector_back.eval()
     gaussian_kernel = get_gaussian_kernel(kernel_size=GAUSSIAN_KERNEL_SIZE, sigma=GAUSSIAN_SIGMA).to(device)
     test_root = os.path.join(args.data_path, item, 'test_public')
-    test_data = MVTecAD2TestPublicDataset(root=test_root, transform=data_transform)
+    test_data = MVTecAD2TestPublicDataset(root=test_root, transform=eval_transform)
     test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=INFER_BATCH_SIZE, shuffle=False, num_workers=4,
                                                   drop_last=False)
 
@@ -352,7 +531,8 @@ def train(item):
 
             output = model(img)
             en, de = output[0], output[1]
-            anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
+            z = [projector_front(en[0]), projector_back(en[1])]
+            anomaly_map, _ = cal_anomaly_maps(z, de, img.shape[-1])
 
             anomaly_map = gaussian_kernel(anomaly_map)
 
