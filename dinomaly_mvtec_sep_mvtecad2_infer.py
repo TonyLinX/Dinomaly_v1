@@ -113,6 +113,25 @@ def _normalize_orig_size(orig_size):
     raise TypeError(f'Unsupported orig_size type: {type(orig_size)}')
 
 
+def efdm(feature, normal_feature, lamda=0.5):
+    """
+    EFDM_test as defined in GNL_resnet_TTA: sort both features, interpolate in value space, then restore order.
+    Expects tensors shaped (B, C, H, W).
+    """
+    lam = 1.0 - lamda
+    B, C, H, W = feature.shape
+    feat_view = feature.view(B, C, -1)
+    norm_view = normal_feature.view(B, C, -1)
+
+    value_feat, index_feat = torch.sort(feat_view, dim=-1)
+    value_norm, _ = torch.sort(norm_view, dim=-1)
+
+    mixed = value_feat + (value_norm - value_feat) * lam
+    inverse_index = index_feat.argsort(dim=-1)
+    mixed = mixed.gather(-1, inverse_index)
+    return mixed.view(B, C, H, W)
+
+
 def build_model():
     encoder = vit_encoder.load(ENCODER_NAME)
     target_layers = TARGET_LAYERS
@@ -152,6 +171,39 @@ def build_model():
     return model
 
 
+def resolve_normal_path(item, args):
+    """
+    Decide which normal sample to use for EFDM. Priority:
+    1) user-provided template (format-able with {item}, {data_path}, {normal_root}, {normal_filename})
+    2) fixed filename under normal_root/item/train/good/{normal_filename}
+    3) first file under normal_root/item/train/good/*
+    """
+    normal_root = args.normal_root if args.normal_root is not None else args.data_path
+    if args.normal_sample_template is not None:
+        candidate = args.normal_sample_template.format(
+            item=item,
+            data_path=args.data_path,
+            normal_root=normal_root,
+            normal_filename=args.normal_filename,
+        )
+        if os.path.isfile(candidate):
+            return candidate
+    fixed = os.path.join(normal_root, item, 'train', 'good', args.normal_filename)
+    if os.path.isfile(fixed):
+        return fixed
+    fallback_glob = glob.glob(os.path.join(normal_root, item, 'train', 'good', '*'))
+    if fallback_glob:
+        return sorted(fallback_glob)[0]
+    raise FileNotFoundError(f'Normal sample not found for {item}; tried {fixed}')
+
+
+def load_normal_sample(item, args, transform, device):
+    path = resolve_normal_path(item, args)
+    img = Image.open(path).convert('RGB')
+    tensor = transform(img).unsqueeze(0).to(device)
+    return tensor, path
+
+
 def inference_one_item(item, args, device, data_transform):
     ckpt_name = args.checkpoint_format.format(item=item)
     ckpt_path = os.path.join(args.save_dir, args.save_name, 'checkpoints', ckpt_name)
@@ -177,6 +229,13 @@ def inference_one_item(item, args, device, data_transform):
     output_root = os.path.join(args.save_dir, args.save_name, 'anomaly_images_test_public')
     os.makedirs(output_root, exist_ok=True)
 
+    normal_en = None
+    normal_path = None
+    if args.efdm:
+        normal_tensor, normal_path = load_normal_sample(item, args, data_transform, device)
+        with torch.no_grad():
+            normal_en, _ = model(normal_tensor)
+
     with torch.no_grad():
         for img, orig_size, img_path in test_loader:
             img = img.to(device)
@@ -187,6 +246,16 @@ def inference_one_item(item, args, device, data_transform):
                 path_list = [img_path]
 
             en, de = model(img)
+            if args.efdm:
+                if normal_en is None:
+                    raise RuntimeError('EFDM is enabled but normal features are not prepared.')
+                adapted = []
+                for f_test, f_norm in zip(en, normal_en):
+                    if f_norm.shape[0] == 1 and f_test.shape[0] > 1:
+                        f_norm = f_norm.expand(f_test.shape[0], -1, -1, -1)
+                    adapted.append(efdm(f_test, f_norm, lamda=args.efdm_lambda))
+                en = adapted
+
             anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
             anomaly_map = gaussian_kernel(anomaly_map)
 
@@ -225,6 +294,15 @@ def parse_args():
     parser.add_argument('--encoder_name', type=str, default=None,
                         help='Backbone encoder identifier (e.g., dinov2reg_vit_small_14/base_14/large_14). '
                              'Defaults to the encoder used during training if known, otherwise small.')
+    parser.add_argument('--efdm', action='store_true', help='Enable EFDM adaptation using a normal sample.')
+    parser.add_argument('--efdm_lambda', type=float, default=0.5, help='Lambda for EFDM interpolation (default 0.5).')
+    parser.add_argument('--normal_root', type=str, default=None,
+                        help='Root containing <item>/train/good images for EFDM. Defaults to data_path.')
+    parser.add_argument('--normal_filename', type=str, default='000_regular.png',
+                        help='Filename of the normal sample under train/good (default 000_regular.png).')
+    parser.add_argument('--normal_sample_template', type=str, default=None,
+                        help='Optional Python format string to pick the normal image; '
+                             'can use {item}, {data_path}, {normal_root}, {normal_filename}.')
     return parser.parse_args()
 
 
@@ -253,6 +331,8 @@ def main():
 
     print_fn(f'Running inference on device: {device}')
     print_fn(f'Encoder: {ENCODER_NAME} | center_crop: {USE_CENTER_CROP} (image_size={IMAGE_SIZE}, crop_size={effective_crop})')
+    if args.efdm:
+        print_fn(f'EFDM enabled | lamda={args.efdm_lambda} | normal_root={args.normal_root or args.data_path} | filename={args.normal_filename}')
     for item in args.items:
         print_fn(f'=== Inference: {item} ===')
         inference_one_item(item, args, device, data_transform)

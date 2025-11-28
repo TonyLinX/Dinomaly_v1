@@ -130,6 +130,59 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
+def efdm(feature, normal_feature, lamda=0.5):
+    """
+    EFDM_test: sort both feature maps, interpolate in value space, then restore original ordering.
+    Expects tensors shaped (B, C, H, W).
+    """
+    lam = 1.0 - lamda
+    B, C, H, W = feature.shape
+    feat_view = feature.view(B, C, -1)
+    norm_view = normal_feature.view(B, C, -1)
+
+    value_feat, index_feat = torch.sort(feat_view, dim=-1)
+    value_norm, _ = torch.sort(norm_view, dim=-1)
+
+    mixed = value_feat + (value_norm - value_feat) * lam
+    inverse_index = index_feat.argsort(dim=-1)
+    mixed = mixed.gather(-1, inverse_index)
+    return mixed.view(B, C, H, W)
+
+
+def resolve_normal_path(item, args):
+    """
+    Pick a normal sample path for EFDM.
+    Priority:
+    1) user template (format-able with {item}, {data_path}, {normal_root}, {normal_filename})
+    2) fixed filename under normal_root/item/train/good/{normal_filename}
+    3) the first file under normal_root/item/train/good/*
+    """
+    normal_root = args.normal_root if args.normal_root is not None else args.data_path
+    if args.normal_sample_template is not None:
+        candidate = args.normal_sample_template.format(
+            item=item,
+            data_path=args.data_path,
+            normal_root=normal_root,
+            normal_filename=args.normal_filename,
+        )
+        if os.path.isfile(candidate):
+            return candidate
+    fixed = os.path.join(normal_root, item, 'train', 'good', args.normal_filename)
+    if os.path.isfile(fixed):
+        return fixed
+    fallback_glob = glob.glob(os.path.join(normal_root, item, 'train', 'good', '*'))
+    if fallback_glob:
+        return sorted(fallback_glob)[0]
+    raise FileNotFoundError(f'Normal sample not found for {item}; tried {fixed}')
+
+
+def load_normal_sample(item, args, transform, device):
+    path = resolve_normal_path(item, args)
+    img = Image.open(path).convert('RGB')
+    tensor = transform(img).unsqueeze(0).to(device)
+    return tensor, path
+
+
 def save_config(args, item_list, use_center_crop: bool):
     """
     Save the effective experiment configuration so this run is fully reproducible.
@@ -378,6 +431,13 @@ def train(item):
     test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=INFER_BATCH_SIZE, shuffle=False, num_workers=4,
                                                   drop_last=False)
 
+    normal_en = None
+    normal_path = None
+    if args.efdm:
+        normal_tensor, normal_path = load_normal_sample(item, args, data_transform, device)
+        with torch.no_grad():
+            normal_en, _ = model(normal_tensor)
+
     with torch.no_grad():
         for img, orig_size, img_path in test_dataloader:
             img = img.to(device)
@@ -385,6 +445,15 @@ def train(item):
 
             output = model(img)
             en, de = output[0], output[1]
+            if args.efdm:
+                if normal_en is None:
+                    raise RuntimeError('EFDM is enabled but normal features are not prepared.')
+                adapted = []
+                for f_test, f_norm in zip(en, normal_en):
+                    if f_norm.shape[0] == 1 and f_test.shape[0] > 1:
+                        f_norm = f_norm.expand(f_test.shape[0], -1, -1, -1)
+                    adapted.append(efdm(f_test, f_norm, lamda=args.efdm_lambda))
+                en = adapted
             anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
 
             anomaly_map = gaussian_kernel(anomaly_map)
@@ -428,6 +497,15 @@ if __name__ == '__main__':
                         help='Disable center crop (use full resized image).')
     parser.add_argument('--encoder_name', type=str, default=DEFAULT_ENCODER_NAME,
                         help='Backbone encoder identifier (e.g., dinov2reg_vit_small_14/base_14/large_14).')
+    parser.add_argument('--efdm', action='store_true', help='Enable EFDM adaptation during inference.')
+    parser.add_argument('--efdm_lambda', type=float, default=0.5, help='Lambda for EFDM interpolation (default 0.5).')
+    parser.add_argument('--normal_root', type=str, default=None,
+                        help='Root containing <item>/train/good images for EFDM. Defaults to data_path.')
+    parser.add_argument('--normal_filename', type=str, default='000_regular.png',
+                        help='Filename of the normal sample under train/good (default 000_regular.png).')
+    parser.add_argument('--normal_sample_template', type=str, default=None,
+                        help='Optional Python format string to pick the normal image; '
+                             'can use {item}, {data_path}, {normal_root}, {normal_filename}.')
     args = parser.parse_args()
 
     # Override encoder and crop behaviour from CLI so rest of script uses chosen settings.
@@ -446,6 +524,8 @@ if __name__ == '__main__':
 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     print_fn(device)
+    if args.efdm:
+        print_fn(f'EFDM enabled | lamda={args.efdm_lambda} | normal_root={args.normal_root or args.data_path} | filename={args.normal_filename}')
 
     result_list = []
     for i, item in enumerate(item_list):

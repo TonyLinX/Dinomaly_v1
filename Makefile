@@ -40,8 +40,12 @@ train_mvtecad2:
 	python dinomaly_mvtec_sep_mvtecad2.py \
 		--data_path $(DATA_ROOT) \
 		--encoder_name $(ENCODER_NAME) \
-		--save_dir ./saved_results \
 		--no_center_crop \
+		--efdm \
+		--efdm_lambda 0.5 \
+		--normal_root /DATA2/tonylinx/dev/ADShift/data/mvtec_ad_2/mvtec_ad_2 \
+		--normal_filename 000_regular.png \
+		--save_dir ./saved_results \
 		--save_name $(EXPNAME)
 
 MVTecAD2_evaluate_test_public:
@@ -59,7 +63,10 @@ inference_mvtecad2:
 		--data_path ./data/mvtec_ad_2 \
 		--save_dir ./saved_results \
 		--save_name $(EXPNAME) \
+		--efdm \
+		--normal_root /DATA2/tonylinx/dev/ADShift/data/mvtec_ad_2/mvtec_ad_2 \
+		--normal_filename 000_regular.png \
+		--efdm_lambda 0.5 \
 		--no_center_crop \
 		--encoder_name $(ENCODER_NAME) \
 		--items can fabric fruit_jelly rice sheet_metal vial wallplugs walnuts
-
