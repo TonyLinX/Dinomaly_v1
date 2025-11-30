@@ -31,17 +31,25 @@ plot_slide:
 	done
 
 DATA_ROOT := ./data/mvtec_ad_2
-EXPNAME := dinov2_small_resize_448_448_without_center_crop
-ENCODER_NAME := dinov2reg_vit_small_14
+EXPNAME := dinov2_base_resize_448_448_without_center_crop_rm_patch
+ENCODER_NAME := dinov2reg_vit_base_14
+DEVICE ?= cuda:0  # 改成 cpu 就跑 CPU
+
+# 如果保持原本 resize 流程，你可以這種寫法，加上要不要 center_crop。
+# python dinomaly_mvtec_sep_mvtecad2.py --input_mode resize [--no_center_crop] 
+# --slide_train_patches_per_image: 每張圖最多隨機保留 N 個 patch
+# --slide_train_patch_ratio: 每張圖保留指定比例的 patch（向下取整，至少 1 個）。只有在沒有設 patches_per_image 時才會用到。
 
 train_and_eval: train_mvtecad2 MVTecAD2_evaluate_test_public
 
 train_mvtecad2:
-	python dinomaly_mvtec_sep_mvtec_ad2.py \
+	python dinomaly_mvtec_sep_mvtecad2.py \
 		--data_path $(DATA_ROOT) \
 		--encoder_name $(ENCODER_NAME) \
 		--save_dir ./saved_results \
 		--no_center_crop \
+		--input_mode slide --slide_window_size 448 --slide_window_overlap 0.1 --slide_train_patches_per_image 1 \
+		--device $(DEVICE) \
 		--save_name $(EXPNAME)
 
 MVTecAD2_evaluate_test_public:
@@ -55,11 +63,13 @@ MVTecAD2_evaluate_test_public:
 	done
 
 inference_mvtecad2:
-	python dinomaly_mvtec_sep_mvtec_ad2_infer.py \
+	python dinomaly_mvtec_sep_mvtecad2_infer.py \
 		--data_path ./data/mvtec_ad_2 \
 		--save_dir ./saved_results \
 		--save_name $(EXPNAME) \
 		--no_center_crop \
 		--encoder_name $(ENCODER_NAME) \
+		--input_mode slide --slide_window_size 448 --slide_window_overlap 0.2 \
+		--device $(DEVICE) \
 		--items can fabric fruit_jelly rice sheet_metal vial wallplugs walnuts
 

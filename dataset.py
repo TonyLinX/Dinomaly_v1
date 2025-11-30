@@ -16,9 +16,20 @@ import json
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 
-def get_data_transforms(size, isize, mean_train=None, std_train=None):
+def get_data_transforms(size, isize, mean_train=None, std_train=None, mode='resize'):
     mean_train = [0.485, 0.456, 0.406] if mean_train is None else mean_train
     std_train = [0.229, 0.224, 0.225] if std_train is None else std_train
+
+    if mode == 'slide':
+        data_transforms = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean_train, std=std_train),
+        ])
+        gt_transforms = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        return data_transforms, gt_transforms
+
     data_transforms = transforms.Compose([
         transforms.Resize((size, size)),
         transforms.ToTensor(),
@@ -44,6 +55,80 @@ def get_strong_transforms(size, isize, mean_train=None, std_train=None):
         transforms.Normalize(mean=mean_train,
                              std=std_train)])
     return data_transforms
+
+
+def sliding_window_grid(width, height, window_size, overlap=0.2):
+    """
+    Build a list of top-left (x, y) coordinates that tile an image with sliding windows.
+    """
+    if overlap < 0 or overlap >= 1:
+        raise ValueError(f"overlap must be in [0, 1); got {overlap}")
+    if window_size <= 0:
+        raise ValueError(f"window_size must be positive; got {window_size}")
+    if window_size > width or window_size > height:
+        raise ValueError(f"window_size={window_size} exceeds image size ({width}x{height})")
+
+    stride = max(1, int(window_size * (1 - overlap)))
+
+    def _positions(limit):
+        if limit <= window_size:
+            return [0]
+        coords = [0]
+        pos = 0
+        while True:
+            if pos + window_size >= limit:
+                break
+            pos = pos + stride
+            if pos + window_size > limit:
+                pos = limit - window_size
+            if pos == coords[-1]:
+                break
+            coords.append(pos)
+        return coords
+
+    xs = _positions(width)
+    ys = _positions(height)
+    return [(x, y) for y in ys for x in xs]
+
+
+class SlidingWindowImageFolder(torch.utils.data.Dataset):
+    """
+    Flatten an ImageFolder into patch-level samples using a sliding window.
+    """
+
+    def __init__(self, root, window_size, overlap=0.2, transform=None, patch_ratio=1.0):
+        self.dataset = ImageFolder(root)
+        self.window_size = window_size
+        self.overlap = overlap
+        self.transform = transform
+        if not (0 < patch_ratio <= 1):
+            raise ValueError(f"patch_ratio must be in (0, 1]; got {patch_ratio}")
+        self.patch_ratio = patch_ratio
+
+        self.index = []
+        for img_idx, (path, target) in enumerate(self.dataset.samples):
+            with Image.open(path) as img:
+                width, height = img.size
+            coords = sliding_window_grid(width, height, window_size, overlap)
+            for x, y in coords:
+                self.index.append((img_idx, x, y))
+        if patch_ratio < 1.0:
+            keep = max(1, int(len(self.index) * patch_ratio))
+            self.index = random.sample(self.index, keep)
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        img_idx, x, y = self.index[idx]
+        path, target = self.dataset.samples[img_idx]
+        with Image.open(path).convert('RGB') as img:
+            patch = img.crop((x, y, x + self.window_size, y + self.window_size))
+
+        if self.transform:
+            patch = self.transform(patch)
+
+        return patch, target
 
 
 class MVTecDataset(torch.utils.data.Dataset):

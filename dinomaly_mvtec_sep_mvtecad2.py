@@ -5,7 +5,7 @@
 
 import torch
 import torch.nn as nn
-from dataset import get_data_transforms, get_strong_transforms
+from dataset import get_data_transforms, get_strong_transforms, SlidingWindowImageFolder, sliding_window_grid
 from torchvision.datasets import ImageFolder
 import numpy as np
 import random
@@ -137,6 +137,13 @@ def save_config(args, item_list, use_center_crop: bool):
             "image_size": IMAGE_SIZE,
             "crop_size": effective_crop,
             "use_center_crop": use_center_crop,
+            "input_mode": getattr(args, "input_mode", "resize"),
+            "slide_window": {
+                "size": getattr(args, "slide_window_size", None),
+                "overlap": getattr(args, "slide_window_overlap", None),
+                "train_patch_ratio": getattr(args, "slide_train_patch_ratio", None),
+                "train_patches_per_image": getattr(args, "slide_train_patches_per_image", None),
+            },
         },
         "model": {
             "encoder_name": ENCODER_NAME,
@@ -211,8 +218,79 @@ class MVTecAD2TestPublicDataset(torch.utils.data.Dataset):
         img_path = self.img_paths[idx]
         img = Image.open(img_path).convert('RGB')
         width, height = img.size
-        img = self.transform(img)
+        if self.transform is not None:
+            img = self.transform(img)
         return img, (height, width), img_path
+
+
+def slide_patch_collate(batch, window_size, overlap, patch_transform, patches_per_image=None, patch_ratio=1.0):
+    """
+    Take a batch of full images, run sliding-window, and keep a subset of patches per image.
+    """
+    patches = []
+    labels = []
+
+    for img, label in batch:
+        width, height = img.size
+        coords = sliding_window_grid(width, height, window_size, overlap)
+
+        selected = coords
+        if patches_per_image is not None and patches_per_image > 0:
+            if len(coords) > patches_per_image:
+                selected = random.sample(coords, patches_per_image)
+        elif patch_ratio < 1.0:
+            keep = max(1, int(len(coords) * patch_ratio))
+            if len(coords) > keep:
+                selected = random.sample(coords, keep)
+
+        for x, y in selected:
+            patch = img.crop((x, y, x + window_size, y + window_size))
+            patch = patch_transform(patch)
+            patches.append(patch)
+            labels.append(label)
+
+    if not patches:
+        raise ValueError("slide_patch_collate produced an empty patch batch.")
+
+    patch_tensor = torch.stack(patches, dim=0)
+    label_tensor = torch.tensor(labels, dtype=torch.long)
+    return patch_tensor, label_tensor
+
+
+def sliding_window_anomaly_map(model, image, gaussian_kernel, data_transform, window_size, overlap, device,
+                               batch_size=1):
+    width, height = image.size
+    coords = sliding_window_grid(width, height, window_size, overlap)
+
+    sum_map = torch.zeros((1, 1, height, width), device=device)
+    count_map = torch.zeros((1, 1, height, width), device=device)
+
+    patches, locs = [], []
+
+    def flush():
+        if not patches:
+            return
+        batch = torch.stack(patches, dim=0).to(device)
+        en, de = model(batch)
+        anomaly_batch, _ = cal_anomaly_maps(en, de, batch.shape[-1])
+        anomaly_batch = gaussian_kernel(anomaly_batch)
+        for idx, (x, y) in enumerate(locs):
+            sum_map[:, :, y:y + window_size, x:x + window_size] += anomaly_batch[idx:idx + 1]
+            count_map[:, :, y:y + window_size, x:x + window_size] += 1
+        patches.clear()
+        locs.clear()
+
+    for x, y in coords:
+        patch = image.crop((x, y, x + window_size, y + window_size))
+        patch_tensor = data_transform(patch)
+        patches.append(patch_tensor)
+        locs.append((x, y))
+        if len(patches) >= batch_size:
+            flush()
+    flush()
+
+    anomaly_map = sum_map / count_map.clamp(min=1e-6)
+    return anomaly_map[0, 0].detach().cpu().numpy().astype(np.float32)
 
 
 def train(item):
@@ -223,15 +301,38 @@ def train(item):
     image_size = IMAGE_SIZE
     crop_size = CROP_SIZE if USE_CENTER_CROP else IMAGE_SIZE
 
-    data_transform, gt_transform = get_data_transforms(image_size, crop_size)
+    is_slide_mode = args.input_mode == 'slide'
+    data_transform, gt_transform = get_data_transforms(
+        image_size,
+        crop_size,
+        mode='slide' if is_slide_mode else 'resize'
+    )
 
     train_path = os.path.join(args.data_path, item, 'train')
     # test_path = os.path.join(args.data_path, item)
 
-    train_data = ImageFolder(root=train_path, transform=data_transform)
-    # test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test_public")
-    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=12,
-                                                   drop_last=True)
+    if is_slide_mode:
+        train_data = ImageFolder(root=train_path, transform=None)
+        collate = partial(
+            slide_patch_collate,
+            window_size=args.slide_window_size,
+            overlap=args.slide_window_overlap,
+            patch_transform=data_transform,
+            patches_per_image=args.slide_train_patches_per_image,
+            patch_ratio=args.slide_train_patch_ratio
+        )
+        train_dataloader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=12,
+            drop_last=True,
+            collate_fn=collate
+        )
+    else:
+        train_data = ImageFolder(root=train_path, transform=data_transform)
+        train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=12,
+                                                       drop_last=True)
     # test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=12)
 
     encoder_name = ENCODER_NAME
@@ -341,23 +442,53 @@ def train(item):
     model.eval()
     gaussian_kernel = get_gaussian_kernel(kernel_size=GAUSSIAN_KERNEL_SIZE, sigma=GAUSSIAN_SIGMA).to(device)
     test_root = os.path.join(args.data_path, item, 'test_public')
-    test_data = MVTecAD2TestPublicDataset(root=test_root, transform=data_transform)
-    test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=INFER_BATCH_SIZE, shuffle=False, num_workers=4,
-                                                  drop_last=False)
+    if is_slide_mode:
+        test_data = MVTecAD2TestPublicDataset(root=test_root, transform=None)
+        test_dataloader = torch.utils.data.DataLoader(
+            test_data,
+            batch_size=1,
+            shuffle=False,
+            num_workers=4,
+            drop_last=False,
+            collate_fn=lambda batch: batch
+        )
+    else:
+        test_data = MVTecAD2TestPublicDataset(root=test_root, transform=data_transform)
+        test_dataloader = torch.utils.data.DataLoader(
+            test_data,
+            batch_size=INFER_BATCH_SIZE,
+            shuffle=False,
+            num_workers=4,
+            drop_last=False
+        )
 
     with torch.no_grad():
-        for img, orig_size, img_path in test_dataloader:
-            img = img.to(device)
-            height, width = orig_size[0].item(), orig_size[1].item()
+        for batch in test_dataloader:
+            if is_slide_mode:
+                img, orig_size, img_path = batch[0]
+                anomaly_map = sliding_window_anomaly_map(
+                    model=model,
+                    image=img,
+                    gaussian_kernel=gaussian_kernel,
+                    data_transform=data_transform,
+                    window_size=args.slide_window_size,
+                    overlap=args.slide_window_overlap,
+                    device=device,
+                    batch_size=INFER_BATCH_SIZE
+                )
+                height, width = orig_size
+            else:
+                img, orig_size, img_path = batch
+                img = img.to(device)
+                height, width = orig_size[0].item(), orig_size[1].item()
 
-            output = model(img)
-            en, de = output[0], output[1]
-            anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
+                en, de = model(img)
+                anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
 
-            anomaly_map = gaussian_kernel(anomaly_map)
+                anomaly_map = gaussian_kernel(anomaly_map)
 
-            anomaly_map = F.interpolate(anomaly_map, size=(height, width), mode='bilinear', align_corners=False)
-            anomaly_map = anomaly_map[0, 0].cpu().numpy().astype(np.float32)
+                anomaly_map = F.interpolate(anomaly_map, size=(height, width), mode='bilinear', align_corners=False)
+                anomaly_map = anomaly_map[0, 0].cpu().numpy().astype(np.float32)
 
             # 保留模型原生輸出，避免 per-image min-max 正規化破壞 ROC/AUPRO 排序
             # a_min, a_max = anomaly_map.min(), anomaly_map.max()
@@ -368,7 +499,12 @@ def train(item):
 
             anomaly_map_f16 = anomaly_map.astype(np.float16)
 
-            rel_path = os.path.relpath(img_path[0], args.data_path)
+            if isinstance(img_path, (list, tuple)):
+                base_path = img_path[0]
+            else:
+                base_path = img_path
+
+            rel_path = os.path.relpath(base_path, args.data_path)
             rel_dir, filename = os.path.split(rel_path)
             basename, _ = os.path.splitext(filename)
             out_rel = os.path.join(rel_dir, basename + '.tiff')
@@ -393,15 +529,29 @@ if __name__ == '__main__':
                         default='vitill_mvtec_sep_dinov2br_c392_en29_bn4dp2_de8_elaelu_md2_i1_it10k_sadm2e3_wd1e4_w1hcosa_ghmp09f01w1k_b16_ev_s1')
     parser.add_argument('--no_center_crop', action='store_true',
                         help='Disable center crop (use full resized image).')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Torch device string, e.g., cuda:0 or cpu. Default auto-selects CUDA if available.')
+    parser.add_argument('--input_mode', choices=['resize', 'slide'], default='resize',
+                        help='resize: keep current resize+crop; slide: tile image into patches instead of resizing.')
+    parser.add_argument('--slide_window_size', type=int, default=IMAGE_SIZE,
+                        help='Patch size for sliding-window mode (e.g., 448).')
+    parser.add_argument('--slide_window_overlap', type=float, default=0.2,
+                        help='Overlap ratio [0,1) between sliding windows.')
+    parser.add_argument('--slide_train_patch_ratio', type=float, default=1.0,
+                        help='Per-image fraction of sliding-window patches to keep for training (0,1]; 1.0 = use all.')
+    parser.add_argument('--slide_train_patches_per_image', type=int, default=None,
+                        help='If set, randomly keep at most this many patches per image (overrides ratio).')
     parser.add_argument('--encoder_name', type=str, default=DEFAULT_ENCODER_NAME,
                         help='Backbone encoder identifier (e.g., dinov2reg_vit_small_14/base_14/large_14).')
     args = parser.parse_args()
 
     # Override encoder and crop behaviour from CLI so rest of script uses chosen settings.
     ENCODER_NAME = args.encoder_name
-    USE_CENTER_CROP = not args.no_center_crop
-    if not USE_CENTER_CROP:
+    USE_CENTER_CROP = (not args.no_center_crop) and args.input_mode == 'resize'
+    if not USE_CENTER_CROP and args.input_mode == 'resize':
         print(f'[Config] Center crop disabled; using image_size={IMAGE_SIZE} as effective crop.')
+    if args.input_mode == 'slide' and args.no_center_crop:
+        print('[Config] Center crop flag ignored in slide mode.')
 
     item_list = ['can', 'fabric', 'fruit_jelly', 'rice', 'sheet_metal', 'vial', 'wallplugs', 'walnuts']
     # item_list = ['leather']
@@ -411,7 +561,10 @@ if __name__ == '__main__':
     # save experiment configuration once per run
     save_config(args, item_list, USE_CENTER_CROP)
 
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    if args.device is not None:
+        device = args.device
+    else:
+        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     print_fn(device)
 
     result_list = []
